@@ -745,6 +745,31 @@ static std::vector<ggml_backend_t> whisper_backend_init()
     return result;
 }
 
+static void whisper_kv_cache_free(struct whisper_kv_cache& cache)
+{
+    ggml_backend_buffer_free(cache.buffer);
+}
+
+static void whisper_batch_free(struct whisper_batch& batch)
+{
+    if (batch.token)
+        free(batch.token);
+    if (batch.pos)
+        free(batch.pos);
+    if (batch.n_seq_id)
+        free(batch.n_seq_id);
+    if (batch.seq_id)
+    {
+        for (int i = 0; batch.seq_id[i]; ++i)
+        {
+            free(batch.seq_id[i]);
+        }
+        free(batch.seq_id);
+    }
+    if (batch.logits)
+        free(batch.logits);
+}
+
 struct whisper_context* whisper_init_with_params_no_state(struct whisper_model_loader* loader)
 {
     ggml_time_init();
@@ -937,6 +962,28 @@ int whisper_full(struct whisper_context* ctx, struct whisper_full_params params,
     return whisper_full_with_state(ctx, ctx->state, params, samples, n_samples);
 }
 
+void whisper_free_state(struct whisper_state* state)
+{
+    if (state)
+    {
+        whisper_kv_cache_free(state->kv_self);
+        whisper_kv_cache_free(state->kv_cross);
+        whisper_kv_cache_free(state->kv_pad);
+        whisper_batch_free(state->batch);
+
+        ggml_backend_sched_free(state->sched_conv.sched);
+        ggml_backend_sched_free(state->sched_encode.sched);
+        ggml_backend_sched_free(state->sched_cross.sched);
+        ggml_backend_sched_free(state->sched_decode.sched);
+
+        for (auto &backend : state->backends) {
+            ggml_backend_free(backend);
+        }
+
+        delete state;
+    }
+}
+
 void whisper_free(struct whisper_context* ctx)
 {
     if (ctx)
@@ -951,7 +998,7 @@ void whisper_free(struct whisper_context* ctx)
             ggml_backend_buffer_free(buf);
         }
 
-        // whisper_free_state(ctx->state);
+        whisper_free_state(ctx->state);
         delete ctx;
     }
 }

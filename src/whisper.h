@@ -31,6 +31,7 @@ struct whisper_kv_cache;
 struct whisper_mel;
 struct whisper_sequence;
 struct whisper_token_data;
+struct whisper_sched;
 
 typedef int32_t whisper_pos;
 typedef int32_t whisper_token;
@@ -627,6 +628,12 @@ struct whisper_filters
     std::vector<float> data;
 };
 
+struct whisper_sched
+{
+    ggml_backend_sched_t sched = nullptr;
+    std::vector<uint8_t> meta;
+};
+
 struct whisper_layer_encoder
 {
     // encoder.blocks.*.attn_ln
@@ -895,12 +902,10 @@ struct whisper_state
     std::vector<ggml_backend_t> backends;
 
     // - stores meta info about the intermediate tensors into the `meta` buffers
-    /**
     whisper_sched sched_conv;
     whisper_sched sched_encode;
     whisper_sched sched_cross;
     whisper_sched sched_decode;
-    **/
 
     struct ggml_tensor* embd_conv = nullptr;
     struct ggml_tensor* embd_enc = nullptr;
@@ -1043,8 +1048,7 @@ int whisper_full(struct whisper_context* ctx, struct whisper_full_params params,
 
 // Frees all allocated memory
 void whisper_free(struct whisper_context* ctx);
-
-// void whisper_free_state(struct whisper_state * state);
+void whisper_free_state(struct whisper_state*  state);
 // void whisper_free_params(struct whisper_full_params * params);
 // void whisper_free_context_params(struct whisper_context_params * params);
 
