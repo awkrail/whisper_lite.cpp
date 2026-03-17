@@ -868,11 +868,194 @@ static struct ggml_cgraph* whisper_build_graph_conv(whisper_context& wctx, whisp
     return gf;
 }
 
+static struct ggml_cgraph* whisper_build_graph_encoder(whisper_context& wctx, whisper_state& wstate)
+{
+    const auto& model = wctx.model;
+    const auto& hparams = model.hparams;
+
+    const int n_ctx = wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx : hparams.n_audio_ctx;
+    const int n_state = hparams.n_audio_state;
+    const int n_head = hparams.n_audio_head;
+    const int n_layer = hparams.n_audio_layer;
+    const int n_state_head = n_state / n_head;
+
+    auto& kv_pad = wstate.kv_pad;
+    const int n_ctx_pad = GGML_PAD(n_ctx, 256);
+
+    struct ggml_init_params params = {
+        wstate.sched_encode.meta.size(),
+        wstate.sched_encode.meta.data(),
+        true,
+    };
+
+    struct ggml_context* ctx0 = ggml_init(params);
+
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, WHISPER_MAX_NODES, false);
+
+    struct ggml_tensor* cur = ggml_view_tensor(ctx0, wstate.embd_conv);
+
+    const float KQscale = 1.0f / sqrtf(float(n_state_head));
+
+    // PE
+    static int iter = 0;
+
+    const size_t e_pe_stride =
+        model.e_pe->ne[0] * ggml_element_size(model.e_pe);
+    const size_t e_pe_offset =
+        model.e_pe->ne[0] * ggml_element_size(model.e_pe) * n_ctx * iter;
+
+    struct ggml_tensor *e_pe = ggml_view_2d(ctx0, model.e_pe, model.e_pe->ne[0],
+                                            n_ctx, e_pe_stride, e_pe_offset);
+    cur = ggml_add(ctx0, e_pe, ggml_cont(ctx0, ggml_transpose(ctx0, cur)));
+
+    struct ggml_tensor *inpL = cur;
+    
+    for (int il = 0; il < n_layer; il++)
+    {
+        const auto& layer = model.layers_encoder[il];
+
+        // norm
+        {
+            cur = ggml_norm(ctx0, inpL, hparams.eps);
+            cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.attn_ln_0_w), layer.attn_ln_0_b);
+        }
+
+        // self-attention
+        {
+            struct ggml_tensor* Qcur = ggml_mul_mat(ctx0, layer.attn_q_w, cur);
+            Qcur = ggml_add(ctx0, Qcur, layer.attn_q_b);
+
+            // note: no bias for Key
+            struct ggml_tensor *Kcur = ggml_mul_mat(ctx0, layer.attn_k_w, cur);
+            struct ggml_tensor *Vcur = ggml_mul_mat(ctx0, layer.attn_v_w, cur);
+            Vcur = ggml_add(ctx0, Vcur, layer.attn_v_b);
+            struct ggml_tensor *Q = ggml_permute(ctx0, ggml_reshape_3d(ctx0, Qcur, n_state_head, n_head, n_ctx), 0, 2, 1, 3);
+
+            // flash attn
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, ggml_view_1d(ctx0, kv_pad.k, n_ctx * n_state, 0)));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, ggml_view_1d(ctx0, kv_pad.v, n_ctx * n_state, 0)));
+
+            struct ggml_tensor *K = ggml_view_3d(ctx0, kv_pad.k, n_state_head, n_ctx_pad,
+                                        n_head, ggml_element_size(kv_pad.k) * n_state,
+                                        ggml_element_size(kv_pad.k) * n_state_head, 0);
+
+            struct ggml_tensor *V = ggml_view_3d(ctx0, kv_pad.v, n_state_head, n_ctx_pad,
+                                        n_head, ggml_element_size(kv_pad.v) * n_state,
+                                        ggml_element_size(kv_pad.v) * n_state_head, 0);
+
+            cur = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, KQscale, 0.0f, 0.0f);
+            cur = ggml_reshape_2d(ctx0, cur, n_state, n_ctx);
+        }
+
+        // projection
+        {
+            cur = ggml_mul_mat(ctx0, layer.attn_ln_1_w, cur);
+            cur = ggml_add(ctx0, cur, layer.attn_ln_1_b);
+        }
+
+        // add the input
+        cur = ggml_add(ctx0, cur, inpL);
+        struct ggml_tensor* inpFF = cur;
+
+        // feed-forward network
+        {
+            // norm
+            {
+                cur = ggml_norm(ctx0, inpFF, hparams.eps);
+                cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.mlp_ln_w), layer.mlp_ln_b);
+            }
+
+            // fully connected
+            cur = ggml_mul_mat(ctx0, layer.mlp_0_w, cur);
+            cur = ggml_add(ctx0, cur, layer.mlp_0_b);
+
+            // GELU
+            cur = ggml_gelu(ctx0, cur);
+
+            // projection
+            cur = ggml_mul_mat(ctx0, layer.mlp_1_w, cur);
+            cur = ggml_add(ctx0, cur, layer.mlp_1_b);
+        }
+        inpL = ggml_add(ctx0, cur, inpFF);
+    }
+
+    cur = inpL;
+
+    // norm
+    {
+        cur = ggml_norm(ctx0, cur, hparams.eps);
+        cur = ggml_add(ctx0, ggml_mul(ctx0, cur, model.e_ln_w), model.e_ln_b);
+    }
+
+    ggml_build_forward_expand(gf, cur);
+    wstate.embd_enc = cur;
+    ggml_free(ctx0);
+
+    return gf;
+}
+
+static struct ggml_cgraph* whisper_build_graph_cross(whisper_context& wctx, whisper_state& wstate)
+{
+    const auto& model = wctx.model;
+    const auto& hparams = model.hparams;
+
+    const int n_ctx = wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx
+                                                 : hparams.n_audio_ctx;
+    const int n_state = hparams.n_audio_state;
+    const int n_head = hparams.n_audio_head;
+
+    const int n_state_head = n_state / n_head;
+
+    const int n_ctx_pad = GGML_PAD(n_ctx, 256);
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/wstate.sched_cross.meta.size(),
+        /*.mem_buffer =*/wstate.sched_cross.meta.data(),
+        /*.no_alloc   =*/true,
+    };
+
+    struct ggml_context *ctx0 = ggml_init(params);
+
+    ggml_cgraph *gf = ggml_new_graph(ctx0);
+
+    struct ggml_tensor *cur = ggml_view_tensor(ctx0, wstate.embd_enc);
+
+    const float Kscale = pow(float(n_state_head), -0.25);
+
+    for (int il = 0; il < model.hparams.n_text_layer; il++)
+    {
+        auto& layer = model.layers_decoder[il];
+
+        struct ggml_tensor *Kcross =
+            ggml_mul_mat(ctx0, layer.cross_attn_k_w, cur);
+
+        Kcross = ggml_scale(ctx0, Kcross, Kscale);
+
+        struct ggml_tensor *Vcross =
+            ggml_mul_mat(ctx0, layer.cross_attn_v_w, cur);
+
+        Vcross = ggml_add(ctx0, Vcross, layer.cross_attn_v_b);
+
+        struct ggml_tensor *k;
+        struct ggml_tensor *v;
+
+        k = ggml_view_1d(ctx0, wstate.kv_cross.k, n_state * n_ctx, (ggml_element_size(wstate.kv_cross.k) * n_state) * (il * n_ctx_pad));
+
+        v = ggml_view_1d(ctx0, wstate.kv_cross.v, n_state * n_ctx, (ggml_element_size(wstate.kv_cross.v) * n_state) * (il * n_ctx_pad));
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcross, k));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcross, v)); 
+    }
+
+    ggml_free(ctx0);
+    return gf;
+}
+
 struct whisper_context* whisper_init_with_params_no_state(struct whisper_model_loader* loader)
 {
-    ggml_time_init();
+ggml_time_init();
 
-    fprintf(stdout, "%s: device = %zu\n", __func__, ggml_backend_dev_count());
+fprintf(stdout, "%s: device = %zu\n", __func__, ggml_backend_dev_count());
     fprintf(stdout, "%s: backends = %zu\n", __func__, ggml_backend_reg_count());
 
     whisper_context* ctx = new whisper_context;
@@ -1064,11 +1247,39 @@ struct whisper_state* whisper_init_state(whisper_context* ctx)
 
     // encoder
     {
-        // bool ok = whisper_sched_graph_init(state->sched_encode, state->)
-    }
-    // cross-attn
-    // decoder
+        bool ok = whisper_sched_graph_init(state->sched_encode, state->backends, [&]() {
+            return whisper_build_graph_encoder(*ctx, *state);
+        });
+        
+        if (!ok)
+        {
+            fprintf(stderr, "%s: failed to init encoder allocator\n",
+                              __func__);
+            whisper_free_state(state);
+            return nullptr;
+        }
 
+        fprintf(stdout, "%s: compute buffer (encode) = %7.2f MB\n", __func__, whisper_sched_size(state->sched_encode) / 1e6);
+    }
+
+    // cross-attn
+    {
+        bool ok = whisper_sched_graph_init(state->sched_cross, state->backends, [&](){ return whisper_build_graph_cross(*ctx, *state); });
+
+        if (!ok)
+        {
+            fprintf(stderr, "%s: failed to init cross allocator\n",
+                              __func__);
+            whisper_free_state(state);
+            return nullptr;
+        }
+
+        fprintf(stdout, "%s: compute buffer (cross)  = %7.2f MB\n", __func__, whisper_sched_size(state->sched_cross) / 1e6);
+    }
+
+    // decoder
+    {
+    }
 
     return state;
 }
