@@ -10,6 +10,7 @@
 #include <climits>
 #include <cstdarg>
 #include <thread>
+#include <functional>
 
 static std::string format(const char *fmt, ...) {
     va_list ap;
@@ -750,6 +751,28 @@ static void whisper_kv_cache_free(struct whisper_kv_cache& cache)
     ggml_backend_buffer_free(cache.buffer);
 }
 
+static struct whisper_batch whisper_batch_init(int32_t n_tokens,
+                                               int32_t n_seq_max)
+{
+    whisper_batch batch = {
+        0, nullptr, nullptr, nullptr, nullptr, nullptr,
+    };
+
+    batch.token = (whisper_token *)malloc(sizeof(whisper_token) * (n_tokens));
+    batch.pos = (whisper_pos *)malloc(sizeof(whisper_pos) * (n_tokens));
+    batch.n_seq_id = (int32_t *)malloc(sizeof(int32_t) * (n_tokens));
+    batch.seq_id =
+        (whisper_seq_id **)malloc(sizeof(whisper_seq_id *) * (n_tokens + 1));
+    for (int i = 0; i < n_tokens; ++i)
+    {
+        batch.seq_id[i] =
+            (whisper_seq_id *)malloc(sizeof(whisper_seq_id) * n_seq_max);
+    }
+    batch.seq_id[n_tokens] = nullptr;
+    batch.logits = (int8_t *)malloc(sizeof(int8_t) * n_tokens);
+    return batch;
+}
+
 static void whisper_batch_free(struct whisper_batch& batch)
 {
     if (batch.token)
@@ -795,6 +818,54 @@ static bool whisper_sched_graph_init(struct whisper_sched &allocr, std::vector<g
 
     ggml_backend_sched_reset(sched);
     return true;
+}
+
+static struct ggml_cgraph* whisper_build_graph_conv(whisper_context& wctx, whisper_state& wstate)
+{
+    const auto& model = wctx.model;
+    const auto& hparams = model.hparams;
+    const int n_ctx = wstate.exp_n_audio_ctx > 0 ? wstate.exp_n_audio_ctx : hparams.n_audio_ctx;
+    const int n_state = hparams.n_audio_state;
+    GGML_UNUSED(n_state);
+
+    const int n_mels = hparams.n_mels;
+
+    struct ggml_init_params params = {
+        wstate.sched_conv.meta.size(),
+        wstate.sched_conv.meta.data(),
+        true,
+    };
+
+    struct ggml_context* ctx0 = ggml_init(params);
+    ggml_cgraph* gf = ggml_new_graph(ctx0);
+
+    struct ggml_tensor* mel = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 2 * n_ctx, n_mels);
+    ggml_set_name(mel, "mel");
+    ggml_set_input(mel);
+
+    struct ggml_tensor *cur = nullptr;
+
+    // conv + gelu
+    {
+        cur = ggml_conv_1d_ph(ctx0, model.e_conv_1_w, mel, 1, 1);
+        cur = ggml_add(ctx0, cur, model.e_conv_1_b);
+
+        cur = ggml_gelu(ctx0, cur);
+
+        cur = ggml_conv_1d_ph(ctx0, model.e_conv_2_w, cur, 2, 1);
+        cur = ggml_add(ctx0, cur, model.e_conv_2_b);
+
+        cur = ggml_gelu(ctx0, cur);
+    }
+    
+    ggml_set_name(cur, "embd_conv");
+    wstate.embd_conv = cur;
+
+    ggml_set_output(cur);
+    ggml_build_forward_expand(gf, cur);
+    ggml_free(ctx0);
+
+    return gf;
 }
 
 struct whisper_context* whisper_init_with_params_no_state(struct whisper_model_loader* loader)

@@ -14,6 +14,7 @@
 #define WHISPER_N_FFT       400
 #define WHISPER_HOP_LENGTH  160
 #define WHISPER_CHUNK_SIZE  30
+#define WHISPER_MAX_NODES 4096
 #define WHISPER_MAX_DECODERS 8
 
 struct whisper_model_loader;
@@ -918,6 +919,7 @@ struct whisper_state
     std::vector<float> logits;
 
     // std::vector<whisper_segment> result_all;
+    int32_t exp_n_audio_ctx = 0; // 0 - use default
 };
 
 struct whisper_context
