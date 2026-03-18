@@ -1269,9 +1269,9 @@ static struct ggml_cgraph* whisper_build_graph_decoder(whisper_context& wctx, wh
 
 struct whisper_context* whisper_init_with_params_no_state(struct whisper_model_loader* loader)
 {
-ggml_time_init();
+    ggml_time_init();
 
-fprintf(stdout, "%s: device = %zu\n", __func__, ggml_backend_dev_count());
+    fprintf(stdout, "%s: device = %zu\n", __func__, ggml_backend_dev_count());
     fprintf(stdout, "%s: backends = %zu\n", __func__, ggml_backend_reg_count());
 
     whisper_context* ctx = new whisper_context;
@@ -1369,6 +1369,251 @@ static bool whisper_kv_cache_init(struct whisper_kv_cache& cache, ggml_backend_t
     ggml_backend_buffer_clear(cache.buffer, 0);
     ggml_free(ctx);
 
+    return true;
+}
+
+#define SIN_COS_N_COUNT WHISPER_N_FFT
+namespace {
+struct whisper_global_cache {
+    // In FFT, we frequently use sine and cosine operations with the same
+    // values. We can use precalculated values to speed up the process.
+    float sin_vals[SIN_COS_N_COUNT];
+    float cos_vals[SIN_COS_N_COUNT];
+
+    // Hann window (Use cosf to eliminate difference)
+    // ref: https://pytorch.org/docs/stable/generated/torch.hann_window.html
+    // ref: https://github.com/openai/whisper/blob/main/whisper/audio.py#L147
+    float hann_window[WHISPER_N_FFT];
+
+    whisper_global_cache() {
+        fill_sin_cos_table();
+        fill_hann_window(sizeof(hann_window) / sizeof(hann_window[0]), true,
+                         hann_window);
+    }
+
+    void fill_sin_cos_table() {
+        for (int i = 0; i < SIN_COS_N_COUNT; i++) {
+            double theta = (2 * M_PI * i) / SIN_COS_N_COUNT;
+            sin_vals[i] = sinf(theta);
+            cos_vals[i] = cosf(theta);
+        }
+    }
+
+    void fill_hann_window(int length, bool periodic, float *output) {
+        int offset = -1;
+        if (periodic) {
+            offset = 0;
+        }
+        for (int i = 0; i < length; i++) {
+            output[i] =
+                0.5 * (1.0 - cosf((2.0 * M_PI * i) / (length + offset)));
+        }
+    }
+} global_cache;
+} // namespace
+
+// naive Discrete Fourier Transform
+// input is real-valued
+// output is complex-valued
+static void dft(const float *in, int N, float *out)
+{
+    const int sin_cos_step = SIN_COS_N_COUNT / N;
+
+    for (int k = 0; k < N; k++) {
+        float re = 0;
+        float im = 0;
+
+        for (int n = 0; n < N; n++) {
+            int idx =
+                (k * n * sin_cos_step) % (SIN_COS_N_COUNT); // t = 2*M_PI*k*n/N
+            re += in[n] * global_cache.cos_vals[idx];       // cos(t)
+            im -= in[n] * global_cache.sin_vals[idx];       // sin(t)
+        }
+
+        out[k * 2 + 0] = re;
+        out[k * 2 + 1] = im;
+    }
+}
+
+// Cooley-Tukey FFT
+// poor man's implementation - use something better
+// input is real-valued
+// output is complex-valued
+static void fft(float *in, int N, float *out)
+{
+    if (N == 1) {
+        out[0] = in[0];
+        out[1] = 0;
+        return;
+    }
+
+    const int half_N = N / 2;
+    if (N - half_N * 2 == 1) {
+        dft(in, N, out);
+        return;
+    }
+
+    float *even = in + N;
+    for (int i = 0; i < half_N; ++i) {
+        even[i] = in[2 * i];
+    }
+    float *even_fft = out + 2 * N;
+    fft(even, half_N, even_fft);
+
+    float *odd = even;
+    for (int i = 0; i < half_N; ++i) {
+        odd[i] = in[2 * i + 1];
+    }
+    float *odd_fft = even_fft + N;
+    fft(odd, half_N, odd_fft);
+
+    const int sin_cos_step = SIN_COS_N_COUNT / N;
+    for (int k = 0; k < half_N; k++) {
+        int idx = k * sin_cos_step;             // t = 2*M_PI*k/N
+        float re = global_cache.cos_vals[idx];  // cos(t)
+        float im = -global_cache.sin_vals[idx]; // sin(t)
+
+        float re_odd = odd_fft[2 * k + 0];
+        float im_odd = odd_fft[2 * k + 1];
+
+        out[2 * k + 0] = even_fft[2 * k + 0] + re * re_odd - im * im_odd;
+        out[2 * k + 1] = even_fft[2 * k + 1] + re * im_odd + im * re_odd;
+
+        out[2 * (k + half_N) + 0] =
+            even_fft[2 * k + 0] - re * re_odd + im * im_odd;
+        out[2 * (k + half_N) + 1] =
+            even_fft[2 * k + 1] - re * im_odd - im * re_odd;
+    }
+}
+
+static void log_mel_spectrogram_worker_thread(int ith, const float* hann, 
+                                              const std::vector<float>& samples, int n_samples, 
+                                              int frame_size, int frame_step, int n_threads,
+                                              const whisper_filters& filters, whisper_mel& mel)
+{
+    std::vector<float> fft_in(frame_size * 2, 0.0);
+    std::vector<float> fft_out(frame_size * 2 * 2 * 2);
+
+    int n_fft = filters.n_fft;
+    int i = ith;
+    
+    for (; i < std::min(n_samples / frame_step + 1, mel.n_len); i += n_threads)
+    {
+        const int offset = i * frame_step;
+
+        // apply Hann window
+        for (int j = 0; j < std::min(frame_size, n_samples - offset); j++)
+        {
+            fft_in[j] = hann[j] * samples[offset + j];
+        }
+
+        // fill the rest with zeros
+        if (n_samples - offset < frame_size)
+            std::fill(fft_in.begin() + (n_samples - offset), fft_in.end(), 0.0);
+
+        // FFT
+        fft(fft_in.data(), frame_size, fft_out.data());
+
+        // Calculate modulus**2 of complex numbers
+        for (int j = 0; j < n_fft; j++)
+        {
+            fft_out[j] = (fft_out[2 * j + 0] * fft_out[2 * j + 0] + fft_out[2 * j + 1] * fft_out[2 * j + 1]);
+        }
+
+        // mel spectrogram
+        for (int j = 0; j < mel.n_mel; j++)
+        {
+            double sum = 0.0;
+            // unroll loop (suggested by GH user @lunixbochs)
+            int k = 0;
+            for (k = 0; k < n_fft - 3; k += 4) {
+                sum += fft_out[k + 0] * filters.data[j * n_fft + k + 0] +
+                       fft_out[k + 1] * filters.data[j * n_fft + k + 1] +
+                       fft_out[k + 2] * filters.data[j * n_fft + k + 2] +
+                       fft_out[k + 3] * filters.data[j * n_fft + k + 3];
+            }
+            // handle n_fft remainder
+            for (; k < n_fft; k++) {
+                sum += fft_out[k] * filters.data[j * n_fft + k];
+            }
+            sum = log10(std::max(sum, 1e-10));
+            mel.data[j * mel.n_len + i] = sum;
+        }
+    }
+
+    // Otherwise fft_out are all zero
+    double sum = log10(1e-10);
+    for (; i < mel.n_len; i += n_threads) {
+        for (int j = 0; j < mel.n_mel; j++) {
+            mel.data[j * mel.n_len + i] = sum;
+        }
+    }
+}
+
+static bool log_mel_spectrogram(whisper_state& wstate, const float* samples,
+                                const int n_samples, const int, const int frame_size,
+                                const int frame_step, const int n_mel, const int n_threads,
+                                const whisper_filters& filters, const bool debug, whisper_mel& mel)
+{
+    const int64_t t_start_us = ggml_time_us();
+    const float* hann = global_cache.hann_window;
+
+    int64_t stage_1_pad = WHISPER_SAMPLE_RATE * 30;
+    int64_t stage_2_pad = frame_size / 2;
+    
+    std::vector<float> samples_padded;
+    samples_padded.resize(n_samples + stage_1_pad + stage_2_pad * 2);
+    std::copy(samples, samples + n_samples,
+              samples_padded.begin() + stage_2_pad);
+
+    // pad 30 seconds of zeros at the end of audio
+    std::fill(
+        samples_padded.begin() + n_samples + stage_2_pad,
+        samples_padded.begin() + n_samples + stage_1_pad + 2 * stage_2_pad, 0);
+
+    // reflective pad 200 samples at the beginning of audio
+    std::reverse_copy(samples + 1, samples + 1 + stage_2_pad, samples_padded.begin());
+
+    mel.n_mel = n_mel;
+    mel.n_len = (samples_padded.size() - frame_size) / frame_step;
+    mel.n_len_org = 1 + (n_samples + stage_2_pad - frame_size) / frame_step;
+    mel.data.resize(mel.n_mel * mel.n_len);
+
+    {
+        std::vector<std::thread> workers(n_threads - 1);
+        for (int iw = 0; iw < n_threads - 1; iw++)
+        {
+            workers[iw] = std::thread(log_mel_spectrogram_worker_thread, iw + 1, hann, 
+                                      std::cref(samples_padded), n_samples + stage_2_pad,
+                                      frame_size, frame_step, n_threads, std::cref(filters), std::ref(mel));
+        }
+
+        // main thread
+        log_mel_spectrogram_worker_thread(0, hann, samples_padded, n_samples + stage_2_pad, 
+                                          frame_size, frame_step, n_threads, filters, mel);
+
+        for (int iw = 0; iw < n_threads - 1; iw++)
+        {
+            workers[iw].join();
+        }
+    }
+
+    // clamp an norm
+    double mmax = -1e20;
+    for (int i = 0; i < mel.n_mel * mel.n_len; i++)
+    {
+        if (mel.data[i] > mmax)
+            mmax = mel.data[i];
+    }
+
+    mmax -= 8.0;
+    for (int i = 0; i < mel.n_mel * mel.n_len; i++)
+    {
+        if (mel.data[i] < mmax)
+            mel.data[i] = mmax;
+
+        mel.data[i] = (mel.data[i] + 4.0f) / 4.0f;
+    }
     return true;
 }
 
@@ -1475,12 +1720,14 @@ struct whisper_state* whisper_init_state(whisper_context* ctx)
             return nullptr;
         }
 
-        fprintf(stdout, "%s: compute buffer (encode) = %7.2f MB\n", __func__, whisper_sched_size(state->sched_encode) / 1e6);
+        fprintf(stdout, "%s: compute buffer (encode) = %7.2f MB\n",
+                __func__, whisper_sched_size(state->sched_encode) / 1e6);
     }
 
     // cross-attn
     {
-        bool ok = whisper_sched_graph_init(state->sched_cross, state->backends, [&](){ return whisper_build_graph_cross(*ctx, *state); });
+        bool ok = whisper_sched_graph_init(state->sched_cross, state->backends, [&](){ 
+            return whisper_build_graph_cross(*ctx, *state); });
 
         if (!ok)
         {
@@ -1490,7 +1737,8 @@ struct whisper_state* whisper_init_state(whisper_context* ctx)
             return nullptr;
         }
 
-        fprintf(stdout, "%s: compute buffer (cross)  = %7.2f MB\n", __func__, whisper_sched_size(state->sched_cross) / 1e6);
+        fprintf(stdout, "%s: compute buffer (cross)  = %7.2f MB\n",
+                __func__, whisper_sched_size(state->sched_cross) / 1e6);
     }
 
     // decoder
@@ -1514,7 +1762,8 @@ struct whisper_state* whisper_init_state(whisper_context* ctx)
             return nullptr;
         }
 
-        fprintf(stdout, "%s: compute buffer (decode)  = %7.2f MB\n", __func__, whisper_sched_size(state->sched_decode) / 1e6);
+        fprintf(stdout, "%s: compute buffer (decode)  = %7.2f MB\n",
+                __func__, whisper_sched_size(state->sched_decode) / 1e6);
     }
 
     return state;
@@ -1629,8 +1878,31 @@ struct whisper_full_params whisper_full_default_params()
     return result;
 }
 
-int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* state, struct whisper_full_params params, const float* samples, int n_samples)
+int whisper_pcm_to_mel_with_state(struct whisper_context* ctx, struct whisper_state* state,
+                                  const float* samples, int n_samples, int n_threads)
 {
+    if (!log_mel_spectrogram(*state, samples, n_samples,
+                             WHISPER_SAMPLE_RATE, WHISPER_N_FFT, WHISPER_HOP_LENGTH,
+                             ctx->model.filters.n_mel, n_threads, ctx->model.filters, false, state->mel))
+    {
+        fprintf(stderr, "%s: failed to compute mel spectrogram\n", __func__);
+        return -1;
+    }
+    return 0;
+}
+
+int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* state,
+                            struct whisper_full_params params, const float* samples, int n_samples)
+{
+    auto& result_all = state->result_all;
+    result_all.clear();
+
+    if (whisper_pcm_to_mel_with_state(ctx, state, samples, n_samples, params.n_threads) != 0)
+    {
+        fprintf(stderr, "%s: failed to compute log mel spectrogram\n", __func__);
+        return -1;
+    }
+
     return 0;
 }
 

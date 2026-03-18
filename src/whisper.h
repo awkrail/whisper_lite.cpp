@@ -611,6 +611,19 @@ struct whisper_mel
     std::vector<float> data;
 };
 
+struct whisper_segment
+{
+    int64_t t0;
+    int64_t t1;
+
+    std::string text;
+    float no_speech_prob;
+
+    std::vector<whisper_token_data> tokens;
+
+    bool speaker_turn_next; // not used
+};
+
 struct whisper_batch
 {
     int32_t n_tokens;
@@ -918,7 +931,8 @@ struct whisper_state
     // decode output (2-dimensional array: [n_tokens][n_vocab])
     std::vector<float> logits;
 
-    // std::vector<whisper_segment> result_all;
+    std::vector<whisper_segment> result_all;
+
     int32_t exp_n_audio_ctx = 0; // 0 - use default
 };
 
