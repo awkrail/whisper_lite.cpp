@@ -11,6 +11,7 @@
 #include <cstdarg>
 #include <thread>
 #include <functional>
+#include <cstring>
 
 static std::string format(const char *fmt, ...) {
     va_list ap;
@@ -25,6 +26,34 @@ static std::string format(const char *fmt, ...) {
     va_end(ap2);
     va_end(ap);
     return std::string(buf.data(), size);
+}
+
+static bool ggml_graph_compute_helper(ggml_backend_sched_t sched,
+                                      struct ggml_cgraph *graph, int n_threads,
+                                      bool sched_reset = true)
+{
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg =
+            dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+
+        auto *fn_set_n_threads =
+            (ggml_backend_set_n_threads_t)ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_set_n_threads");
+        if (fn_set_n_threads) {
+            fn_set_n_threads(backend, n_threads);
+        }
+    }
+
+    const bool t =
+        (ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS);
+
+    if (!t || sched_reset) {
+        ggml_backend_sched_reset(sched);
+    }
+
+    return t;
 }
 
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
@@ -1267,6 +1296,81 @@ static struct ggml_cgraph* whisper_build_graph_decoder(whisper_context& wctx, wh
     return gf;
 }
 
+static bool whisper_encode_internal(whisper_context& wctx, whisper_state& wstate, const int mel_offset, const int n_threads)
+{
+    const int64_t t_start_us = ggml_time_us();
+
+    // conv
+    {
+        auto &sched = wstate.sched_conv.sched;
+
+        ggml_cgraph *gf = whisper_build_graph_conv(wctx, wstate);
+
+        if (!ggml_backend_sched_alloc_graph(sched, gf))
+            return false;
+
+        struct ggml_tensor* mel = ggml_graph_get_tensor(gf, "mel");
+
+        {
+            const auto &mel_inp = wstate.mel;
+            const int n_ctx = wstate.exp_n_audio_ctx > 0
+                                  ? wstate.exp_n_audio_ctx
+                                  : wctx.model.hparams.n_audio_ctx;
+
+            wstate.inp_mel.resize(ggml_nelements(mel));
+
+            float *dst = wstate.inp_mel.data();
+            memset(dst, 0, ggml_nbytes(mel));
+
+            const int i0 = std::min(mel_offset, mel_inp.n_len);
+            const int i1 = std::min(mel_offset + 2 * n_ctx, mel_inp.n_len);
+
+            for (int j = 0; j < mel_inp.n_mel; ++j) {
+                for (int i = i0; i < i1; ++i) {
+                    dst[j * 2 * n_ctx + (i - i0)] =
+                        mel_inp.data[j * mel_inp.n_len + i];
+                }
+            }
+
+            ggml_backend_tensor_set(mel, wstate.inp_mel.data(), 0, ggml_nelements(mel) * sizeof(float));
+        }
+
+        if (!ggml_graph_compute_helper(sched, gf, n_threads))
+            return false;
+    }
+
+    // encoder
+    {
+        auto& sched = wstate.sched_encode.sched;
+
+        ggml_cgraph* gf = whisper_build_graph_encoder(wctx, wstate);
+
+        if (!ggml_backend_sched_alloc_graph(sched, gf))
+            return false;
+
+        if (!ggml_graph_compute_helper(sched, gf, n_threads))
+            return false;
+    }
+
+    // cross
+    {
+        auto& sched = wstate.sched_cross.sched;
+
+        ggml_cgraph* gf = whisper_build_graph_cross(wctx, wstate);
+
+        if (!ggml_backend_sched_alloc_graph(sched, gf))
+            return false;
+
+        if (!ggml_graph_compute_helper(sched, gf, n_threads))
+            return false;
+    }
+
+    wstate.t_encode_us += ggml_time_us() - t_start_us;
+    wstate.n_encode++;
+
+    return true;
+}
+
 struct whisper_context* whisper_init_with_params_no_state(struct whisper_model_loader* loader)
 {
     ggml_time_init();
@@ -1617,6 +1721,25 @@ static bool log_mel_spectrogram(whisper_state& wstate, const float* samples,
     return true;
 }
 
+int whisper_n_len_from_state(struct whisper_state* state)
+{
+    return state->mel.n_len_org;
+}
+
+int whisper_n_text_ctx(struct whisper_context* ctx)
+{
+    return ctx->model.hparams.n_text_ctx;
+}
+
+int whisper_n_audio_ctx(struct whisper_context *ctx)
+{
+    return ctx->model.hparams.n_audio_ctx;
+}
+
+whisper_token whisper_token_sot(struct whisper_context *ctx) {
+    return ctx->vocab.token_sot;
+}
+
 struct whisper_state* whisper_init_state(whisper_context* ctx)
 {
     whisper_state* state = new whisper_state;
@@ -1900,6 +2023,53 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
     if (whisper_pcm_to_mel_with_state(ctx, state, samples, n_samples, params.n_threads) != 0)
     {
         fprintf(stderr, "%s: failed to compute log mel spectrogram\n", __func__);
+        return -1;
+    }
+
+    const int seek_start = params.offset_ms / 10;
+    const int seek_end = params.duration_ms == 0 
+        ? whisper_n_len_from_state(state)
+        : seek_start + params.duration_ms / 10;
+
+    const int delta_min = 10;
+    if (seek_end < seek_start + delta_min)
+    {
+        printf("%s: input is too short - %d ms < 100 ms.", __func__, (seek_end - seek_start) * 10);
+        return 0;
+    }
+
+    auto& decoder = state->decoders[0];
+    decoder.sequence.tokens.reserve(state->decoders[0].sequence.tokens.capacity());
+    decoder.probs.resize(ctx->vocab.n_vocab);
+    decoder.logits.resize(ctx->vocab.n_vocab);
+    decoder.logprobs.resize(ctx->vocab.n_vocab);
+    decoder.logits_id.reserve(ctx->model.hparams.n_vocab);
+    decoder.rng = std::mt19937(0);
+
+    /**
+    auto &prompt_past0 = state->prompt_past0;
+    auto &prompt_past1 = state->prompt_past1;
+    prompt_past0.clear();
+    **/
+
+    const int max_prompt_ctx = std::min(params.n_max_text_ctx, whisper_n_text_ctx(ctx) / 2);
+    
+    if (params.audio_ctx > whisper_n_audio_ctx(ctx))
+    {
+        printf("%s: audio_ctx is larger than the maximum allowed.", __func__);
+        return -1;
+    }
+    state->exp_n_audio_ctx = params.audio_ctx;
+
+    std::vector<whisper_token> prompt_init = { whisper_token_sot(ctx), };
+    int seek = seek_start;
+
+    std::vector<whisper_token> prompt;
+    prompt.reserve(whisper_n_text_ctx(ctx));
+
+    if (!whisper_encode_internal(*ctx, *state, seek, params.n_threads))
+    {
+        printf("%s: failed to encode\n", __func__);
         return -1;
     }
 
