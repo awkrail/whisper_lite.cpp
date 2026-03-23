@@ -438,6 +438,61 @@ static void whisper_process_logits(struct whisper_context &ctx,
     whisper_compute_probs(logits, n_logits, logprobs, probs);
 }
 
+static whisper_token_data whisper_sample_token(whisper_context& ctx, const whisper_decoder& decoder, bool best)
+{
+    whisper_token_data result = {
+        0, 0, 0.0f, 0.0f, 0.0f, 0.0f, -1, -1, 0.0f,
+    };
+
+    const auto &vocab = ctx.vocab;
+
+    const auto &probs = decoder.probs;
+    const auto &logprobs = decoder.logprobs;
+
+    const int n_logits = vocab.n_vocab;
+
+    {
+        double sum_ts = 0.0;
+        double max_ts = 0.0;
+
+        for (int i = vocab.token_beg; i < n_logits; i++)
+        {
+            if (probs[i] == -INFINITY)
+                continue;
+
+            sum_ts += probs[i];
+            if (max_ts < probs[i])
+            {
+                max_ts = probs[i];
+                result.tid = i;
+            }
+
+            result.pt = max_ts / (sum_ts + 1e-10);
+            result.ptsum = sum_ts;
+        }
+    }
+
+    if (best)
+    {
+        for (int i = 0; i < n_logits; i++)
+        {
+            if (result.p > probs[i])
+            {
+                result.id = i;
+                result.p = probs[i];
+                result.plog = logprobs[i];
+            }
+        }
+    }
+
+    if (result.id >= vocab.token_beg) {
+        result.tid = result.id;
+        result.pt = result.p;
+    }
+
+    return result;
+}
+
 static bool whisper_model_load(struct whisper_model_loader* loader, whisper_context& wctx)
 {
     fprintf(stdout, "%s: loading model\n", __func__);
@@ -2199,15 +2254,33 @@ int whisper_n_audio_ctx(struct whisper_context* ctx)
     return ctx->model.hparams.n_audio_ctx;
 }
 
-whisper_token whisper_token_sot(struct whisper_context *ctx) {
+const char* whisper_token_to_str(struct whisper_context* ctx, whisper_token token)
+{
+    return ctx->vocab.id_to_token.at(token).c_str();
+}
+
+whisper_token whisper_token_beg(struct whisper_context *ctx)
+{
+    return ctx->vocab.token_beg;
+}
+
+whisper_token whisper_token_eot(struct whisper_context* ctx)
+{
+    return ctx->vocab.token_eot;
+}
+
+whisper_token whisper_token_sot(struct whisper_context* ctx)
+{
     return ctx->vocab.token_sot;
 }
 
-whisper_token whisper_token_lang(struct whisper_context *ctx, int lang_id) {
+whisper_token whisper_token_lang(struct whisper_context *ctx, int lang_id)
+{
     return whisper_token_sot(ctx) + 1 + lang_id;
 }
 
-whisper_token whisper_token_nosp(struct whisper_context *ctx) {
+whisper_token whisper_token_nosp(struct whisper_context *ctx)
+{
     return ctx->vocab.token_nosp;
 }
 
@@ -2586,13 +2659,144 @@ int whisper_full_with_state(struct whisper_context* ctx, struct whisper_state* s
         }
     }
 
-    /**
-    for (int i = 0, n_max = whisper_n_text_ctx(ctx) / 2 -4; i < n_max; i++)
+    // auto-regressive decoding until the token reaches eot
+    for (int i = 0, n_max = whisper_n_text_ctx(ctx) / 2 - 4; i < n_max; i++)
     {
-    }
-    **/
+        const int64_t t_start_sample_us = ggml_time_us();
 
+        // sampling
+        {
+            auto &decoder = state->decoders[0];
+            if (decoder.completed || decoder.failed)
+                continue;
+
+            decoder.sequence.tokens.push_back(whisper_sample_token(*ctx, decoder, true));
+            decoder.sequence.sum_logprobs_all += decoder.sequence.tokens.back().plog;
+        }
+
+        if (decoder.completed || decoder.failed)
+            continue;
+
+        auto& has_ts = decoder.has_ts;
+        auto& failed = decoder.failed;
+        auto& completed = decoder.completed;
+        auto& seek_delta = decoder.seek_delta;
+        auto& result_len = decoder.sequence.result_len;
+        
+        {
+            const auto& token = decoder.sequence.tokens.back();
+
+            if (token.id > whisper_token_beg(ctx))
+            {
+                const int seek_delta_new = 2 * (token.id - whisper_token_beg(ctx));
+
+                // do not allow to go back in time
+                if (has_ts && seek_delta > seek_delta_new && result_len < i)
+                {
+                    fprintf(stderr, "%s: decoder failed due to seek_delta (%d > %d)\n",
+                            __func__, seek_delta, seek_delta_new);
+                    failed = true;
+                    continue;
+                }
+                
+                seek_delta = seek_delta_new;
+                result_len = i + 1;
+                has_ts = true;
+            }
+
+            if (token.id == whisper_token_eot(ctx) ||
+                (params.max_tokens > 0 && i >= params.max_tokens) ||
+                (has_ts && seek + seek_delta + delta_min >= seek_end))
+            {
+                if (result_len == 0 && !params.no_timestamps)
+                {
+                    result_len = i + 1;
+                }
+                else
+                {
+                    fprintf(stderr, "%s: decoder failed\n", __func__);
+                    failed = true;
+                    continue;
+                }
+
+                if (params.single_segment || params.no_timestamps)
+                {
+                    result_len = i + 1;
+                    seek_delta = 100 * WHISPER_CHUNK_SIZE;
+                }
+                
+                completed = true;
+                continue;
+            }
+        }
+
+        state->t_sample_us += ggml_time_us() - t_start_sample_us;
+
+        // obtain logits for the next token
+        {
+            auto& batch = state->batch;
+            batch.n_tokens = 0;
+            
+            const int n_past = prompt.size() + i;
+
+            decoder.i_batch = batch.n_tokens;
+            batch.token[batch.n_tokens] = decoder.sequence.tokens.back().id;
+            batch.pos[batch.n_tokens] = n_past;
+            batch.n_seq_id[batch.n_tokens] = 1;
+            batch.seq_id[batch.n_tokens][0] = 0;
+            batch.logits[batch.n_tokens] = 1;
+            batch.n_tokens++;
+
+            if (!whisper_decode_internal(*ctx, *state, state->batch, params.n_threads, false))
+            {
+                fprintf(stderr, "%s: failed to decode\n", __func__);
+                return -1;
+            }
+
+            const int64_t t_start_sample_us = ggml_time_us();
+            whisper_process_logits(*ctx, *state, decoder, params, t_cur);
+
+            state->t_sample_us += ggml_time_us() - t_start_sample_us;
+        }
+    }
+
+    // output results
+    {
+        auto seek_delta = decoder.seek_delta;
+        const auto result_len = decoder.sequence.result_len;
+        const auto& tokens_cur = decoder.sequence.tokens;
+
+        const bool is_no_speech = (state->no_speech_prob > params.no_speech_thold && decoder.sequence.avg_logprobs < params.logprob_thold);
+
+        std::string text;
+
+        if (!is_no_speech)
+        {
+            auto t0 = seek + 2 * (tokens_cur.front().tid - whisper_token_beg(ctx));
+            auto t1 = seek + seek_delta;
+
+            if (!tokens_cur.empty())
+            {
+                for (int i = 0; i < (int)tokens_cur.size(); i++)
+                {
+                    if (tokens_cur[i].id < whisper_token_eot(ctx))
+                        text += whisper_token_to_str(ctx, tokens_cur[i].id);
+                }
+            }
+            result_all.push_back({t0, t1, text, state->no_speech_prob, {}, false});
+        }
+    }
     return 0;
+}
+
+int whisper_full_n_segments(struct whisper_context* ctx)
+{
+    return ctx->state->result_all.size();
+}
+
+const char* whisper_full_get_segment_text(struct whisper_context *ctx, int i_segment)
+{
+    return ctx->state->result_all[i_segment].text.c_str();
 }
 
 int whisper_full(struct whisper_context* ctx, struct whisper_full_params params, const float* samples, int n_samples)

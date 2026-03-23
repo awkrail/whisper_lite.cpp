@@ -1072,6 +1072,10 @@ whisper_token whisper_token_sot(struct whisper_context *ctx);
 whisper_token whisper_token_lang(struct whisper_context *ctx, int lang_id);
 whisper_token whisper_token_nosp(struct whisper_context *ctx);
 
+int whisper_full_n_segments(struct whisper_context* ctx);
+const char* whisper_full_get_segment_text(struct whisper_context *ctx, int i_segment);
+
+
 // Frees all allocated memory
 void whisper_free(struct whisper_context* ctx);
 void whisper_free_state(struct whisper_state*  state);

@@ -19,7 +19,18 @@ struct whisper_params
     std::string fname_inp;
 };
 
-
+static void print_segments(struct whisper_context * ctx, bool no_timestamps) {
+    const int n = whisper_full_n_segments(ctx);
+    printf("\n");
+    for (int i = 0; i < n; ++i) {
+        if (!no_timestamps) {
+            printf("[%s --> %s]  ",
+                   to_timestamp(0).c_str(),
+                   to_timestamp(0).c_str());
+        }
+        printf("%s\n", whisper_full_get_segment_text(ctx, i));
+    }
+}
 
 int main(int argc, char* argv[])
 {
@@ -58,6 +69,11 @@ int main(int argc, char* argv[])
         whisper_free(ctx);
         return 1;
     }
+
+    print_segments(ctx, false);
+
+    //whisper_print_timings(ctx);
+    whisper_free(ctx);
 
     return 0;
 }
